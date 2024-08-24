@@ -12,6 +12,9 @@
   <depend>rclcpp</depend>
   <depend>sensor_msgs</depend>
 
+  <!-- Only required for MJPEG to RGB converison -->
+  <depend>ffmpeg</depend>
+
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>
 

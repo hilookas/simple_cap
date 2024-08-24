@@ -9,10 +9,34 @@ endif()
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
-find_package(OpenCV REQUIRED)
+
+pkg_check_modules(avcodec REQUIRED libavcodec)
+pkg_check_modules(avutil REQUIRED libavutil)
+pkg_check_modules(swscale REQUIRED libswscale)
+
+if(EXISTS ${avcodec})
+  message(STATUS "Found libavcodec: ${avcodec}")
+endif()
+
+if(EXISTS ${avutil})
+  message(STATUS "Found libavutil: ${avutil}")
+endif()
+
+if(EXISTS ${swscale})
+  message(STATUS "Found libswscale: ${swscale}")
+endif()
 
 add_executable(simple_cap_node src/simple_cap_node.cpp)
-ament_target_dependencies(simple_cap_node rclcpp sensor_msgs OpenCV)
+ament_target_dependencies(simple_cap_node 
+  rclcpp 
+  sensor_msgs
+)
+
+target_link_libraries(simple_cap_node
+  ${avcodec_LIBRARIES}
+  ${avutil_LIBRARIES}
+  ${swscale_LIBRARIES}
+)
 
 install(TARGETS
   simple_cap_node

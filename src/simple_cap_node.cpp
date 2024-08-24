@@ -38,7 +38,7 @@ static int xioctl(int fh, uint32_t request, void *arg) {
     return r;
 }
 
-#define CAP_PROP_BUFFERSIZE 1
+#define CAP_PROP_BUFFERSIZE 2
 
 void cap_thread(
     rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr pub, 
@@ -46,6 +46,11 @@ void cap_thread(
     int image_width, int image_height, double framerate, 
     int resize_image_width, int resize_image_height
 ) {
+    if (resize_image_width == 0 || resize_image_height == 0) {
+        resize_image_width = image_width;
+        resize_image_height = image_height;
+    }
+
     const char *dev_name = device.c_str();
 
     // open_device
@@ -180,6 +185,93 @@ void cap_thread(
     ret = xioctl(fd, VIDIOC_STREAMON, &type);
     assert(ret != -1); // errno_exit("VIDIOC_STREAMON");
 
+
+
+    // ffmpeg
+    // Suppress warnings from ffmpeg libraries to avoid spamming the console
+    av_log_set_level(AV_LOG_FATAL);
+    av_log_set_flags(AV_LOG_SKIP_REPEATED);
+    // av_log_set_flags(AV_LOG_PRINT_LEVEL);
+
+    int m_result = 0;
+    char *m_averror_str = reinterpret_cast<char *>(malloc(AV_ERROR_MAX_STRING_SIZE));
+
+    const int m_align = 32;
+    
+    // device frame
+    AVFrame *m_avframe_device = av_frame_alloc();
+    m_avframe_device->width = image_width;
+    m_avframe_device->height = image_height;
+    m_avframe_device->format = AV_PIX_FMT_YUV422P;
+
+    size_t m_avframe_device_size = static_cast<size_t>(
+        av_image_get_buffer_size(
+            (AVPixelFormat)m_avframe_device->format,
+            m_avframe_device->width,
+            m_avframe_device->height,
+            m_align
+        )
+    );
+
+    m_result = av_frame_get_buffer(m_avframe_device, m_align);
+    if (m_result != 0) {
+        av_make_error_string(m_averror_str, AV_ERROR_MAX_STRING_SIZE, m_result);
+        std::cerr << m_averror_str << std::endl;
+    }
+    
+    // rgb frame
+    AVFrame *m_avframe_rgb = av_frame_alloc();
+    m_avframe_rgb->width = resize_image_width;
+    m_avframe_rgb->height = resize_image_height;
+    m_avframe_rgb->format = AV_PIX_FMT_RGB24;
+    
+    size_t m_avframe_rgb_size = static_cast<size_t>(
+        av_image_get_buffer_size(
+            (AVPixelFormat)m_avframe_rgb->format,
+            m_avframe_rgb->width,
+            m_avframe_rgb->height,
+            m_align
+        )
+    );
+
+    m_result = av_frame_get_buffer(m_avframe_rgb, m_align);
+    if (m_result != 0) {
+        av_make_error_string(m_averror_str, AV_ERROR_MAX_STRING_SIZE, m_result);
+        std::cerr << m_averror_str << std::endl;
+    }
+    
+    // decoding
+    AVCodec *m_avcodec = avcodec_find_decoder(AVCodecID::AV_CODEC_ID_MJPEG);
+    if (!m_avcodec) {
+        throw std::runtime_error("Could not find MJPEG decoder");
+    }
+    
+    AVCodecParserContext *m_avparser = av_parser_init(AVCodecID::AV_CODEC_ID_MJPEG);
+    if (!m_avparser) {
+        throw std::runtime_error("Could not find MJPEG parser");
+    }
+
+    AVCodecContext *m_avcodec_context = avcodec_alloc_context3(m_avcodec);
+    m_avcodec_context->width = image_width;
+    m_avcodec_context->height = image_height;
+    m_avcodec_context->pix_fmt = (AVPixelFormat)m_avframe_device->format;
+    m_avcodec_context->codec_type = AVMEDIA_TYPE_VIDEO;
+
+    AVDictionary *m_avoptions = NULL;
+
+    // Initialize AVCodecContext
+    if (avcodec_open2(m_avcodec_context, m_avcodec, &m_avoptions) < 0) {
+        throw std::runtime_error("Could not open decoder");
+        return;
+    }
+
+    SwsContext *m_sws_context = sws_getContext(
+        image_width, image_height, (AVPixelFormat)m_avframe_device->format,
+        resize_image_width, resize_image_height, (AVPixelFormat)m_avframe_rgb->format,
+        SWS_FAST_BILINEAR,
+        NULL, NULL, NULL
+    );
+
     // mainloop
     for (;;) {
         fd_set fds;
@@ -221,40 +313,62 @@ void cap_thread(
             }
         }
         assert(buf.index < n_buffers);
-        
-        // Ref: https://github.com/opencv/opencv/blob/4.x/modules/videoio/src/cap_v4l.cpp
-        cv::Mat image(cv::Size(image_width, image_height), CV_8UC3);
-        cv::imdecode(cv::Mat(1, buf.bytesused, CV_8U, buffers[buf.index].start), cv::IMREAD_COLOR, &image);
-        cv::cvtColor(image, image, cv::COLOR_BGR2RGB);
-        
-        if (resize_image_width) {
-            cv::resize(image, image, cv::Size(resize_image_width, resize_image_height));
-        }
 
+        // prepare msg
         sensor_msgs::msg::Image::SharedPtr msg = std::make_shared<sensor_msgs::msg::Image>();
         msg->header.stamp.sec = buf.timestamp.tv_sec;
         msg->header.stamp.nanosec = buf.timestamp.tv_usec * 1000;
         msg->header.frame_id = "default_cam";
-        msg->height = image.rows;
-        msg->width = image.cols;
+        msg->height = resize_image_height;
+        msg->width = resize_image_width;
         msg->encoding = "rgb8";
         msg->is_bigendian = (rcpputils::endian::native == rcpputils::endian::big);
-        msg->step = image.cols * image.elemSize();
-        size_t size = msg->step * image.rows;
-        msg->data.resize(size);
+        msg->step = resize_image_width * 3;
+        msg->data.resize(m_avframe_rgb_size);
+        memset(reinterpret_cast<char *>(&msg->data[0]), 0, m_avframe_rgb_size);
 
-        if (image.isContinuous()) {
-            memcpy(reinterpret_cast<char *>(&msg->data[0]), image.data, size);
-        } else {
-            // Copy by row by row
-            uchar *ros_data_ptr = reinterpret_cast<uchar *>(&msg->data[0]);
-            uchar *cv_data_ptr = image.data;
-            for (int i = 0; i < image.rows; ++i) {
-                memcpy(ros_data_ptr, cv_data_ptr, msg->step);
-                ros_data_ptr += msg->step;
-                cv_data_ptr += image.step;
-            }
+        // decode
+        auto avpacket = av_packet_alloc();
+        av_new_packet(avpacket, buf.bytesused);
+        memcpy(avpacket->data, (uint8_t *)buffers[buf.index].start, buf.bytesused);
+
+        // Pass src MJPEG image to decoder
+        m_result = avcodec_send_packet(m_avcodec_context, avpacket);
+
+        av_packet_free(&avpacket);
+
+        // If result is not 0, report what went wrong
+        if (m_result != 0) {
+            std::cerr << "Failed to send AVPacket to decode: ";            
+            av_make_error_string(m_averror_str, AV_ERROR_MAX_STRING_SIZE, m_result);
+            std::cerr << m_averror_str << std::endl;
+            return;
         }
+
+        m_result = avcodec_receive_frame(m_avcodec_context, m_avframe_device);
+
+        if (m_result == AVERROR(EAGAIN) || m_result == AVERROR_EOF) {
+            return;
+        } else if (m_result < 0) {
+            std::cerr << "Failed to recieve decoded frame from codec: ";
+            av_make_error_string(m_averror_str, AV_ERROR_MAX_STRING_SIZE, m_result);
+            std::cerr << m_averror_str << std::endl;
+            return;
+        }
+
+        sws_scale(
+            m_sws_context, m_avframe_device->data,
+            m_avframe_device->linesize, 0, m_avframe_device->height,
+            m_avframe_rgb->data, m_avframe_rgb->linesize
+        );
+
+        av_image_copy_to_buffer(
+            const_cast<uint8_t *>(reinterpret_cast<const uint8_t *>(reinterpret_cast<char *>(&msg->data[0]))),
+            m_avframe_rgb_size, m_avframe_rgb->data,
+            m_avframe_rgb->linesize, (AVPixelFormat)m_avframe_rgb->format,
+            m_avframe_rgb->width, m_avframe_rgb->height, m_align
+        );
+
         pub->publish(*msg);
 
         // give back buffer
@@ -281,6 +395,32 @@ void cap_thread(
     assert(ret != -1); // errno_exit("close");
 
     fd = -1;
+
+
+
+    // ffmpeg
+    if (m_averror_str) {
+        free(m_averror_str);
+    }
+    if (m_avoptions) {
+        free(m_avoptions);
+    }
+    if (m_avcodec_context) {
+        avcodec_close(m_avcodec_context);
+        avcodec_free_context(&m_avcodec_context);
+    }
+    if (m_avframe_device) {
+        av_frame_free(&m_avframe_device);
+    }
+    if (m_avframe_rgb) {
+        av_frame_free(&m_avframe_rgb);
+    }
+    if (m_avparser) {
+        av_parser_close(m_avparser);
+    }
+    if (m_sws_context) {
+        sws_freeContext(m_sws_context);
+    }
 }
 
 int main(int argc, char * argv[]) {
