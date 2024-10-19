@@ -4,6 +4,9 @@
 #include <string>
 #include <thread>
 
+#include <chrono>
+#include <utility>
+
 #include <errno.h>
 #include <fcntl.h> /* low-level i/o */
 #include <sys/ioctl.h>
@@ -30,7 +33,7 @@ static int xioctl(int fh, uint32_t request, void *arg) {
     return r;
 }
 
-#define CAP_PROP_BUFFERSIZE 1
+#define CAP_PROP_BUFFERSIZE 2
 
 void cap_thread(
     rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr pub, 
@@ -248,6 +251,12 @@ void cap_thread(
             }
         }
         pub->publish(*msg);
+
+        static std::chrono::high_resolution_clock::time_point last_time;
+        std::chrono::high_resolution_clock::time_point this_time = std::chrono::high_resolution_clock::now();
+        double duration = std::chrono::duration_cast<std::chrono::nanoseconds>(this_time - last_time).count() / 1000000.0;
+        printf("%lfms\n", duration);
+        last_time = this_time;
 
         // give back buffer
         ret = xioctl(fd, VIDIOC_QBUF, &buf);
